@@ -176,6 +176,8 @@ Finally, we display the fitted repo curve, implied volatility table, quadratic s
 
 The run summary reports the timestamp of the latest option trade seen in the fetched chains (in ET) and warns when quotes are more than 30 minutes old, which typically means the market is closed and the surface reflects the last session. Live data fetches are cached for 15 minutes, so repeated runs within that window reuse the same snapshot instead of re-hitting Yahoo Finance and FRED.
 
+If one asset's option chains are temporarily unavailable from Yahoo Finance, the dashboard backfills that asset from the last saved complete snapshot and shows a warning with the age of the fallback data, so users always see a surface. Backfilled runs never overwrite the saved snapshot, and the failed fetch is not cached, so the next run retries live data.
+
 ## 5. Dashboard Features
 
 - Fetch latest market data (cached for 15 minutes; runs automatically on first visit and hourly thereafter, with the last downloaded snapshot persisted to disk so new visitors always see a surface)

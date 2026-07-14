@@ -747,6 +747,26 @@ if run_clicked or auto_fetch:
                     st.error("Missing FRED_API_KEY in Streamlit secrets.")
                     st.stop()
                 data = load_latest_cached(fred_key, DATA_FETCH_VERSION)
+                if not data.get("spx_quotes") or not data.get("spy_quotes"):
+                    # Partial fetch: don't let it stick in the 15-minute cache —
+                    # clear the entry so the next run retries live — and backfill
+                    # the missing asset from the last complete snapshot so users
+                    # still see a surface (with a warning about its age).
+                    load_latest_cached.clear()
+                    fallback = load_snapshot()
+                    if fallback is not None:
+                        filled = vf.merge_partial_data(data, fallback["data"])
+                        if filled:
+                            data = dict(data)
+                            data["backfilled_assets"] = filled
+                            saved_dt = datetime.fromtimestamp(
+                                fallback["saved_at"], ZoneInfo("America/New_York")
+                            ).strftime("%Y-%m-%d %H:%M %Z")
+                            data.setdefault("warnings", []).append(
+                                f"{' and '.join(filled)} option chains are temporarily unavailable "
+                                f"from yfinance — showing the last saved data from {saved_dt}. "
+                                "Click Run analysis to retry."
+                            )
                 source_label = "Latest available yfinance option chains + FRED Treasury curve"
             else:
                 if uploaded is None:
@@ -793,7 +813,7 @@ if asset_choice in ("SPX", "Both"):
             data["spx_quotes"], False, data["spx_rates"]
         ))
     else:
-        st.warning("SPX option chains are temporarily unavailable from yfinance.")
+        st.warning("SPX option chains are temporarily unavailable from yfinance. Click Run analysis to retry.")
 if asset_choice in ("SPY", "Both"):
     if data.get("spy_quotes"):
         assets.append((
@@ -802,7 +822,7 @@ if asset_choice in ("SPY", "Both"):
             data["spy_quotes"], True, data["spy_rates"]
         ))
     else:
-        st.warning("SPY option chains are temporarily unavailable from yfinance.")
+        st.warning("SPY option chains are temporarily unavailable from yfinance. Click Run analysis to retry.")
 
 if not assets:
     st.error("No usable option quotes are available for the selected asset.")
@@ -959,7 +979,10 @@ for label, spot, divs, ydiv, quotes, american, rates in assets:
         mime="text/csv",
     )
 
-if mode == "Fetch latest data":
+# Only persist complete, fully-fresh fetches: a partial or backfilled snapshot
+# would overwrite the last good data with a mix of ages stamped as new.
+if (mode == "Fetch latest data" and data.get("spx_quotes") and data.get("spy_quotes")
+        and not data.get("backfilled_assets")):
     save_snapshot(
         data,
         source_label,

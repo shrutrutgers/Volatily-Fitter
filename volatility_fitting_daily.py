@@ -790,6 +790,28 @@ def load_latest_data(fred_api_key=FRED_API_KEY):
     }
 
 
+def merge_partial_data(new, old):
+    """Backfill assets missing from a partial fetch using older data.
+
+    Mutates `new` in place, copying per-asset fields from `old` for any asset
+    whose option chains came back empty. Returns the list of backfilled asset
+    labels so the caller can warn that stale data is being displayed.
+    """
+    asset_fields = {
+        "SPX": ("spx_spot", "spx_quotes", "spx_rates", "spx_div_yield"),
+        "SPY": ("spy_spot", "spy_quotes", "spy_rates", "spy_div_yield", "spy_divs"),
+    }
+    filled = []
+    for label, fields in asset_fields.items():
+        quotes_key = f"{label.lower()}_quotes"
+        if not new.get(quotes_key) and old.get(quotes_key):
+            for k in fields:
+                if k in old:
+                    new[k] = old[k]
+            filled.append(label)
+    return filled
+
+
 def build_curve(per_tenor, fallback):
     if not per_tenor:
         return sorted(fallback, key=lambda x: x[0])

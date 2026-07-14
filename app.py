@@ -902,21 +902,18 @@ for label, spot, divs, ydiv, quotes, american, rates in assets:
                 key=f"{label}-greeks",
             )
             if american:
-                st.caption(
-                    "Note: A kink at the ATM boundary (log-moneyness 0) is expected, especially for long tenors. "
-                    "The curve switches from OTM puts to OTM calls there, and the two sides do not stitch perfectly: "
-                    "the call-equivalent transform (1 + put delta) is exact only under European put-call parity, "
-                    "which American options do not satisfy — American puts carry extra early-exercise premium "
-                    "(amplified by dividends), so their delta and gamma sit systematically off the call line. "
-                    "Put/call IV misalignment from the single bootstrapped repo rate adds to the jump. "
-                    "These effects grow with time to expiry, so the kink is largest at the longest tenors."
+                st.info(
+                    "A small kink at the ATM boundary (log-moneyness = 0) is expected, especially for longer "
+                    "expiries. The curve switches from OTM puts to OTM calls at this point, and because American "
+                    "options do not satisfy put-call parity exactly (due to early-exercise premium, particularly "
+                    "with dividends), the two sides do not join perfectly. This effect grows with maturity, "
+                    "making the kink more noticeable for longer-dated options."
                 )
             else:
                 st.caption(
-                    "Note: a small kink at the ATM boundary (log-moneyness 0) can appear where the curve switches "
-                    "from OTM puts to OTM calls. For European options put-call parity holds in theory, so the "
-                    "residual jump reflects put/call quote noise and any repo-rate misfit rather than early "
-                    "exercise; it grows with tenor as carry uncertainty accumulates."
+                    "No kink is expected at the ATM boundary for SPX: European options satisfy put-call parity, "
+                    "so the put and call wings join smoothly. Compare with SPY, where the American early-exercise "
+                    "premium produces a visible kink."
                 )
             st.markdown(f"**Greeks — {tenor_label(selected_tenor)} (OTM options)**")
             st.dataframe(

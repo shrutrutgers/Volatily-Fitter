@@ -1,3 +1,4 @@
+import json
 import math
 import os
 import sys
@@ -12,6 +13,12 @@ SQRT2PI = math.sqrt(2 * math.pi)
 FRED_API_KEY = os.environ.get("FRED_API_KEY", "")
 FRED_CACHE_TTL_SECONDS = 3600
 _FRED_CURVE_CACHE = {"timestamp": 0.0, "curve": None}
+# Committed snapshot of the last successfully fetched Treasury curve. Streamlit
+# Community Cloud IPs sometimes get a hard 403 from FRED's edge, so the live
+# app falls back to this file (refreshed by any environment where FRED works).
+FALLBACK_CURVE_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "treasury_curve_fallback.json"
+)
 Q_MIN = -0.02
 Q_MAX = 0.12
 # 0.1% relative spot bump: small enough for accurate central differences,
@@ -666,6 +673,30 @@ def fetch_fred_rate(series_id, api_key):
     return None
 
 
+def save_fallback_curve(curve, path=FALLBACK_CURVE_PATH):
+    try:
+        with open(path, "w") as f:
+            json.dump({
+                "saved_at": datetime.now().astimezone().isoformat(),
+                "curve": [[t, r] for t, r in curve],
+            }, f, indent=2)
+    except OSError:
+        pass  # read-only filesystem (e.g. some cloud deploys); keep the old file
+
+
+def load_fallback_curve(path=FALLBACK_CURVE_PATH):
+    """Return (curve, saved_at_iso) from the committed snapshot, or None."""
+    try:
+        with open(path) as f:
+            payload = json.load(f)
+        curve = sorted((float(t), float(r)) for t, r in payload["curve"])
+        if not curve:
+            return None
+        return curve, payload.get("saved_at", "unknown date")
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
 def load_fred_curve(api_key=FRED_API_KEY):
     if not api_key:
         raise RuntimeError("Missing FRED API key. Set FRED_API_KEY or enter it in the dashboard.")
@@ -697,6 +728,7 @@ def load_fred_curve(api_key=FRED_API_KEY):
     curve.sort(key=lambda x: x[0])
     _FRED_CURVE_CACHE["timestamp"] = now
     _FRED_CURVE_CACHE["curve"] = list(curve)
+    save_fallback_curve(curve)
     return curve
 
 
@@ -757,10 +789,19 @@ def load_latest_data(fred_api_key=FRED_API_KEY):
     quote_times = [ts for ts in (spx_quote_time, spy_quote_time) if ts is not None]
     quote_time = max(quote_times) if quote_times else None
 
+    curve_source = "fetched from FRED"
     try:
         curve = sorted(load_fred_curve(fred_api_key), key=lambda x: x[0])
     except Exception as exc:
-        raise RuntimeError(f"Could not fetch Treasury rates from FRED: {exc}") from exc
+        fallback = load_fallback_curve()
+        if fallback is None:
+            raise RuntimeError(f"Could not fetch Treasury rates from FRED: {exc}") from exc
+        curve, saved_at = fallback
+        curve_source = f"saved fallback from {saved_at}"
+        warnings.append(
+            f"Could not fetch Treasury rates from FRED ({exc}); "
+            f"using the saved Treasury curve from {saved_at}."
+        )
 
     spx_div_yield = fallback_spx_div_yield
     spy_divs = fallback_spy_divs
@@ -783,7 +824,7 @@ def load_latest_data(fred_api_key=FRED_API_KEY):
     print(f"  SPY spot: {spy_spot:.2f}")
     print("  SPX expiries:", ", ".join(s for s, _ in spx_expiries))
     print("  SPY expiries:", ", ".join(s for s, _ in spy_expiries))
-    print("  Treasury curve: fetched from FRED")
+    print(f"  Treasury curve: {curve_source}")
     print(f"  SPX dividend yield proxy: {spx_div_yield:.4%}")
     print(f"  SPY carry prior: {spy_div_yield:.4%}")
     print("  SPY dividend assumptions:", ", ".join(f"{t:.2f}y:${d:.2f}" for t, d in spy_divs))

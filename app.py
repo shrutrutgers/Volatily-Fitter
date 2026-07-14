@@ -8,6 +8,7 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+from plotly.subplots import make_subplots
 from openpyxl import Workbook
 
 import volatility_fitting_daily as vf
@@ -298,6 +299,7 @@ def analyze_asset(label, spot, divs, ydiv, quotes, curve, american, per_tenor, v
 
     ivs = vf.compute_ivs(spot, rate_curve, div_list, repo, quotes, american)
     coefs = vf.fit_surface(spot, rate_curve, div_list, repo, ivs)
+    greeks = vf.compute_greeks(spot, rate_curve, div_list, repo, coefs, ivs, american)
 
     repo_rows = []
     for t in sorted(repo):
@@ -313,12 +315,13 @@ def analyze_asset(label, spot, divs, ydiv, quotes, curve, american, per_tenor, v
         })
 
     iv_rows = []
-    for t, rows in ivs.items():
+    greek_rows = []
+    for t, rows in greeks.items():
         r = vf.interp_rate(rate_curve, t)
         forward = (spot - vf.pv_divs(div_list, t, rate_curve)) * math.exp((r - repo[t]) * t)
-        for strike, is_call, iv in rows:
+        for strike, is_call, iv, delta, skew_delta, gamma, skew_gamma in rows:
             is_otm = (is_call and strike >= forward) or ((not is_call) and strike <= forward)
-            iv_rows.append({
+            base = {
                 "asset": label,
                 "tenor": t,
                 "strike": strike,
@@ -328,6 +331,14 @@ def analyze_asset(label, spot, divs, ydiv, quotes, curve, american, per_tenor, v
                 "iv_percent": 100 * iv,
                 "log_moneyness": math.log(strike / forward),
                 "forward": forward,
+            }
+            iv_rows.append(base)
+            greek_rows.append({
+                **base,
+                "delta": delta,
+                "skew_delta": skew_delta,
+                "gamma": gamma,
+                "skew_gamma": skew_gamma,
             })
 
     coef_rows = []
@@ -343,7 +354,7 @@ def analyze_asset(label, spot, divs, ydiv, quotes, curve, american, per_tenor, v
             "n": vals["n"],
         })
 
-    return pd.DataFrame(repo_rows), pd.DataFrame(iv_rows), pd.DataFrame(coef_rows)
+    return pd.DataFrame(repo_rows), pd.DataFrame(iv_rows), pd.DataFrame(coef_rows), pd.DataFrame(greek_rows)
 
 
 def fitted_surface_figure(asset, iv_df, coef_df):
@@ -487,6 +498,76 @@ def smile_figure(asset, iv_df, coef_df):
     return fig
 
 
+def greeks_figure(asset, greeks_df, coef_df, tenor):
+    fig = make_subplots(
+        rows=1, cols=2,
+        subplot_titles=("OTM Delta vs Skew OTM Delta", "Gamma vs Skew-Gamma"),
+        horizontal_spacing=0.08,
+    )
+    if greeks_df.empty:
+        return fig
+
+    part = greeks_df[(greeks_df["tenor"] == tenor) & (greeks_df["is_otm"])].sort_values("log_moneyness")
+    if part.empty:
+        return fig
+
+    hover = part["option"] + " K=" + part["strike"].round(2).astype(str)
+    is_put = part["option"] == "Put"
+    # Put delta is negative (-1..0); call-equivalent = 1 + delta (== 1 - |delta|)
+    # puts the put wing on the same 0..1 scale as calls so the smile reads as
+    # one continuous curve instead of jumping across zero at the ATM boundary.
+    delta_plot = part["delta"].where(~is_put, 1 + part["delta"])
+    skew_delta_plot = part["skew_delta"].where(~is_put, 1 + part["skew_delta"])
+    styles = [
+        (delta_plot, skew_delta_plot, "#68a8ff", "#f26b5b", 1),
+        (part["gamma"], part["skew_gamma"], "#68a8ff", "#f26b5b", 2),
+    ]
+    for plain, skew, plain_color, skew_color, col in styles:
+        fig.add_trace(go.Scatter(
+            x=part["log_moneyness"],
+            y=plain,
+            mode="lines+markers",
+            name="Plain",
+            legendgroup="plain",
+            showlegend=(col == 1),
+            text=hover,
+            line={"width": 2, "color": plain_color},
+            marker={"size": 7, "color": plain_color},
+        ), row=1, col=col)
+        fig.add_trace(go.Scatter(
+            x=part["log_moneyness"],
+            y=skew,
+            mode="lines+markers",
+            name="Skew",
+            legendgroup="skew",
+            showlegend=(col == 1),
+            text=hover,
+            line={"width": 2, "color": skew_color, "dash": "dash"},
+            marker={"size": 7, "color": skew_color, "symbol": "diamond-open"},
+        ), row=1, col=col)
+
+    fig.update_layout(
+        title=f"{asset} Greeks ({tenor_label(tenor)}, OTM options)",
+        template="plotly_dark",
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="#0d121c",
+        font={"color": "#d8deea"},
+        height=460,
+        margin={"l": 0, "r": 0, "t": 70, "b": 0},
+        legend_title="Convention",
+    )
+    for col, y_title in [(1, "OTM Delta"), (2, "Gamma")]:
+        fig.update_xaxes(
+            title_text="log(K / F)", gridcolor="#2a3444", zerolinecolor="#556174",
+            row=1, col=col,
+        )
+        fig.update_yaxes(
+            title_text=y_title, gridcolor="#2a3444", zerolinecolor="#556174",
+            row=1, col=col,
+        )
+    return fig
+
+
 def front_month_smile_figure(asset, iv_df, coef_df):
     fig = go.Figure()
     if iv_df.empty or coef_df.empty:
@@ -596,28 +677,43 @@ st.markdown(
     "and visualizes the fitted quadratic surface."
 )
 
-if not run_clicked:
+if run_clicked:
+    try:
+        with st.spinner("Loading market data..."):
+            if mode == "Fetch latest data":
+                fred_key = get_secret("FRED_API_KEY")
+                if not fred_key:
+                    st.error("Missing FRED_API_KEY in Streamlit secrets.")
+                    st.stop()
+                data = load_latest_cached(fred_key, DATA_FETCH_VERSION)
+                source_label = "Latest available yfinance option chains + FRED Treasury curve"
+            else:
+                if uploaded is None:
+                    st.error("Upload an OptionData.xlsx file first.")
+                    st.stop()
+                data = load_excel_from_upload(uploaded)
+                source_label = uploaded.name
+    except Exception as exc:
+        st.error(str(exc))
+        st.stop()
+
+    # Cache across reruns: any widget touch (e.g. the Greeks expiry dropdown)
+    # reruns this whole script and st.button reverts to False, so results must
+    # survive outside the run_clicked branch or the page resets to the intro screen.
+    st.session_state["run_data"] = data
+    st.session_state["run_source_label"] = source_label
+    st.session_state["run_mode"] = mode
+    st.session_state["run_asset_choice"] = asset_choice
+    st.session_state["run_asset_results"] = {}
+
+if "run_data" not in st.session_state:
     st.info("Choose a data source in the sidebar and click Run analysis.")
     st.stop()
 
-try:
-    with st.spinner("Loading market data..."):
-        if mode == "Fetch latest data":
-            fred_key = get_secret("FRED_API_KEY")
-            if not fred_key:
-                st.error("Missing FRED_API_KEY in Streamlit secrets.")
-                st.stop()
-            data = load_latest_cached(fred_key, DATA_FETCH_VERSION)
-            source_label = "Latest available yfinance option chains + FRED Treasury curve"
-        else:
-            if uploaded is None:
-                st.error("Upload an OptionData.xlsx file first.")
-                st.stop()
-            data = load_excel_from_upload(uploaded)
-            source_label = uploaded.name
-except Exception as exc:
-    st.error(str(exc))
-    st.stop()
+data = st.session_state["run_data"]
+source_label = st.session_state["run_source_label"]
+mode = st.session_state["run_mode"]
+asset_choice = st.session_state["run_asset_choice"]
 
 assets = []
 if asset_choice in ("SPX", "Both"):
@@ -653,11 +749,15 @@ st.caption(source_label)
 for warning in data.get("warnings", []):
     st.warning(warning)
 
+asset_results = st.session_state["run_asset_results"]
+
 for label, spot, divs, ydiv, quotes, american, rates in assets:
-    with st.spinner(f"Computing {label} surface..."):
-        repo_df, iv_df, coef_df = analyze_asset(
-            label, spot, divs, ydiv, quotes, data["curve"], american, rates, DATA_FETCH_VERSION
-        )
+    if label not in asset_results:
+        with st.spinner(f"Computing {label} surface..."):
+            asset_results[label] = analyze_asset(
+                label, spot, divs, ydiv, quotes, data["curve"], american, rates, DATA_FETCH_VERSION
+            )
+    repo_df, iv_df, coef_df, greeks_df = asset_results[label]
 
     st.divider()
     st.header(label)
@@ -670,7 +770,7 @@ for label, spot, divs, ydiv, quotes, american, rates in assets:
     if label == "SPY":
         st.caption("Note: short-tenor SPY repo can be unstable because it is bootstrapped from limited/noisy ATM American option pairs. See the documentation Limitations section.")
 
-    tab_surface, tab_smiles, tab_tables = st.tabs(["Surface", "Smiles", "Tables"])
+    tab_surface, tab_smiles, tab_greeks, tab_tables = st.tabs(["Surface", "Smiles", "Greeks", "Tables"])
 
     with tab_surface:
         surface_col, skew_col = st.columns([2, 1])
@@ -683,6 +783,44 @@ for label, spot, divs, ydiv, quotes, american, rates in assets:
     with tab_smiles:
         st.caption("Tenor labels are shown in calendar weeks, months, or years. Fit legend entries include R² as a quick fit-quality indicator.")
         st.plotly_chart(smile_figure(label, iv_df, coef_df), use_container_width=True)
+
+    with tab_greeks:
+        st.caption(
+            "OTM delta/gamma are Black-Scholes spot sensitivities of each out-of-the-money option, holding its "
+            "fitted IV fixed. Skew OTM delta/gamma additionally account for the option sliding along the fitted "
+            "smile as spot moves (sticky-moneyness convention). The delta chart plots puts as call-equivalent "
+            "delta (1 + put delta) so the put and call wings read as one continuous curve; the table below still "
+            "shows raw signed delta."
+        )
+        greek_tenors = sorted(greeks_df["tenor"].unique())
+        if greek_tenors:
+            nearest_tenor = min(greek_tenors)
+            selected_tenor = st.selectbox(
+                "Expiry",
+                greek_tenors,
+                index=greek_tenors.index(nearest_tenor),
+                format_func=tenor_label,
+                key=f"{label}-greeks-tenor",
+            )
+            st.plotly_chart(
+                greeks_figure(label, greeks_df, coef_df, selected_tenor),
+                use_container_width=True,
+                key=f"{label}-greeks",
+            )
+            st.markdown(f"**Greeks — {tenor_label(selected_tenor)}**")
+            st.dataframe(
+                greeks_df[greeks_df["tenor"] == selected_tenor],
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "delta": st.column_config.NumberColumn("OTM Delta", format="%.4f"),
+                    "skew_delta": st.column_config.NumberColumn("Skew OTM Delta", format="%.4f"),
+                    "gamma": st.column_config.NumberColumn("Gamma", format="%.6f"),
+                    "skew_gamma": st.column_config.NumberColumn("Skew Gamma", format="%.6f"),
+                },
+            )
+        else:
+            st.info("No greeks available for this asset.")
 
     with tab_tables:
         table_cols = st.columns([1.2, 1.2, 1.6])
@@ -703,5 +841,12 @@ for label, spot, divs, ydiv, quotes, american, rates in assets:
         f"Download {label} IV data",
         csv,
         file_name=f"{label.lower()}_implied_vols.csv",
+        mime="text/csv",
+    )
+    greeks_csv = greeks_df.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        f"Download {label} Greeks data",
+        greeks_csv,
+        file_name=f"{label.lower()}_greeks.csv",
         mime="text/csv",
     )

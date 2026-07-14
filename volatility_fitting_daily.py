@@ -14,6 +14,10 @@ FRED_CACHE_TTL_SECONDS = 3600
 _FRED_CURVE_CACHE = {"timestamp": 0.0, "curve": None}
 Q_MIN = -0.02
 Q_MAX = 0.12
+# 0.1% relative spot bump: small enough for accurate central differences,
+# large enough that American PDE interpolation noise doesn't dominate gamma.
+GREEK_BUMP_REL = 0.001
+SIG_FLOOR = 0.01
 
 
 def npdf(x):
@@ -65,19 +69,43 @@ def bs_vega(S, K, T, r, q, sig):
     return S * math.exp(-q * T) * npdf(d1) * sT
 
 
+def bs_delta(S, K, T, r, q, sig, is_call):
+    if T <= 0 or sig <= 0:
+        if is_call:
+            return 1.0 if S > K else 0.0
+        return -1.0 if S < K else 0.0
+    sT = math.sqrt(T)
+    d1 = (math.log(S / K) + (r - q + 0.5 * sig * sig) * T) / (sig * sT)
+    if is_call:
+        return math.exp(-q * T) * ncdf(d1)
+    return math.exp(-q * T) * (ncdf(d1) - 1.0)
+
+
+def bs_gamma(S, K, T, r, q, sig):
+    if T <= 0 or sig <= 0:
+        return 0.0
+    sT = math.sqrt(T)
+    d1 = (math.log(S / K) + (r - q + 0.5 * sig * sig) * T) / (sig * sT)
+    return math.exp(-q * T) * npdf(d1) / (S * sig * sT)
+
+
 # Crank-Nicolson PDE for American options on a log-spot grid.
 # Uses the Brennan-Schwartz algorithm: a single back-substitution per timestep
 # that enforces the early-exercise constraint inline. Works for puts (sweep
 # upward from low S) and calls on dividend-paying stock (sweep downward).
-def american_pde(S, K, T, r, q, sig, is_call, M=200, N=200):
+def american_pde(S, K, T, r, q, sig, is_call, M=200, N=200, grid_center=None, grid_sig=None):
     if T <= 0:
         return max(S - K, 0.0) if is_call else max(K - S, 0.0)
     if sig <= 0:
         F = S * math.exp((r - q) * T)
         return math.exp(-r * T) * (max(F - K, 0.0) if is_call else max(K - F, 0.0))
 
-    sT = sig * math.sqrt(T)
-    x_mid = math.log(S)
+    # grid_center/grid_sig let bumped-spot greek calls share one exact grid:
+    # re-centering or re-scaling the grid per call shifts the payoff kink
+    # relative to the nodes, and that discretization noise swamps h^2 in
+    # finite-difference gammas.
+    sT = (grid_sig if grid_sig else sig) * math.sqrt(T)
+    x_mid = math.log(grid_center if grid_center else S)
     x_max = x_mid + 6 * sT
     x_min = x_mid - 6 * sT
     dx = (x_max - x_min) / M
@@ -135,7 +163,17 @@ def american_pde(S, K, T, r, q, sig, is_call, M=200, N=200):
         V[-1] = V_hi
         V[1:-1] = sol
 
-    return float(np.interp(math.log(S), x, V))
+    # Local quadratic instead of linear interpolation: linear interp is flat in
+    # its second derivative inside a cell, which would zero out finite-difference
+    # gammas when bumped evaluations land within one grid cell. Evaluating at
+    # the grid center (every non-greek call) returns the node value either way.
+    xq = math.log(S)
+    i = min(max(int(round((xq - x_min) / dx)), 1), M - 1)
+    xm, xc, xp = x[i - 1], x[i], x[i + 1]
+    lm = (xq - xc) * (xq - xp) / ((xm - xc) * (xm - xp))
+    lc = (xq - xm) * (xq - xp) / ((xc - xm) * (xc - xp))
+    lp = (xq - xm) * (xq - xc) / ((xp - xm) * (xp - xc))
+    return float(lm * V[i - 1] + lc * V[i] + lp * V[i + 1])
 
 
 def _bs_solve(sub, diag, sup, rhs, payoff):
@@ -345,6 +383,62 @@ def fit_surface(S, curve, divs, repo, ivs):
                 ys.append(iv)
         a, b, c, r2, rmse, n_points = fit_quad(np.array(xs), np.array(ys))
         out[t] = {"a": a, "b": b, "c": c, "r2": r2, "rmse": rmse, "n": n_points}
+    return out
+
+
+def compute_greeks(S, curve, divs, repo, coefs, ivs, american, M=120, N=120):
+    """Returns {tenor: [(K, is_call, iv, delta, skew_delta, gamma, skew_gamma), ...]}"""
+    out = {}
+    for t, rows in ivs.items():
+        r = interp_rate(curve, t)
+        q = repo[t]
+        S_eff = S - pv_divs(divs, t, curve)
+        cf = coefs.get(t)
+        h = GREEK_BUMP_REL * S_eff
+        res = []
+        for K, is_call, sig in rows:
+            if american:
+                p_mid = american_pde(S_eff, K, t, r, q, sig, is_call, M, N, grid_center=S_eff)
+                p_up = american_pde(S_eff + h, K, t, r, q, sig, is_call, M, N, grid_center=S_eff)
+                p_dn = american_pde(S_eff - h, K, t, r, q, sig, is_call, M, N, grid_center=S_eff)
+                delta = (p_up - p_dn) / (2 * h)
+                gamma = (p_up - 2 * p_mid + p_dn) / (h * h)
+            else:
+                delta = bs_delta(S_eff, K, t, r, q, sig, is_call)
+                gamma = bs_gamma(S_eff, K, t, r, q, sig)
+                p_mid = bs(S_eff, K, t, r, q, sig, is_call)
+
+            if cf is None:
+                skew_delta, skew_gamma = delta, gamma
+            else:
+                # Reuse the already-fitted (a, b, c) at the bumped moneyness
+                # rather than re-fitting per bump: the smile shape is assumed
+                # sticky in log-moneyness, only the option's position on it moves.
+                a, b, c = cf["a"], cf["b"], cf["c"]
+                F = S_eff * math.exp((r - q) * t)
+                x0 = math.log(K / F)
+                sig_smile = max(a + b * x0 + c * x0 * x0, SIG_FLOOR)
+
+                def smile_price(S_b):
+                    F_b = S_b * math.exp((r - q) * t)
+                    x_b = math.log(K / F_b)
+                    sig_b = max(a + b * x_b + c * x_b * x_b, SIG_FLOOR)
+                    if american:
+                        return american_pde(S_b, K, t, r, q, sig_b, is_call, M, N,
+                                            grid_center=S_eff, grid_sig=sig_smile)
+                    return bs(S_b, K, t, r, q, sig_b, is_call)
+
+                sp_up = smile_price(S_eff + h)
+                sp_dn = smile_price(S_eff - h)
+                # The gamma stencil mid must sit on the fitted smile too: the
+                # quoted iv is off the fit by inversion tolerance + residual,
+                # and that price gap divided by h^2 would swamp the true gamma.
+                sp_mid = smile_price(S_eff)
+                skew_delta = (sp_up - sp_dn) / (2 * h)
+                skew_gamma = (sp_up - 2 * sp_mid + sp_dn) / (h * h)
+
+            res.append((K, is_call, sig, delta, skew_delta, gamma, skew_gamma))
+        out[t] = res
     return out
 
 

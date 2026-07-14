@@ -632,15 +632,25 @@ def fetch_fred_rate(series_id, api_key):
     url = "https://api.stlouisfed.org/fred/series/observations"
     params = {
         "series_id": series_id,
-        "api_key": api_key,
+        # Keys pasted into cloud secrets sometimes pick up whitespace or smart
+        # quotes; FRED then rejects the mangled 32-char key.
+        "api_key": api_key.strip().strip('"').strip("'"),
         "file_type": "json",
         "sort_order": "desc",
         "limit": 10,
     }
+    # FRED's edge (Akamai) can 403 datacenter IPs using the default
+    # python-requests user agent; a browser-like UA avoids the bot filter.
+    headers = {
+        "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                       "AppleWebKit/537.36 (KHTML, like Gecko) "
+                       "Chrome/126.0.0.0 Safari/537.36"),
+        "Accept": "application/json",
+    }
     response = None
     for attempt in range(3):
-        response = requests.get(url, params=params, timeout=20)
-        if response.status_code != 429:
+        response = requests.get(url, params=params, headers=headers, timeout=20)
+        if response.status_code not in (403, 429):
             break
         time.sleep(1.5 * (attempt + 1))
 

@@ -124,44 +124,7 @@ def american_pde(S, K, T, r, q, sig, is_call, M=200, N=200, grid_center=None, gr
     B_ = -0.5 * dt * (sig * sig / (dx * dx) + r)
     C_ = 0.25 * dt * (sig * sig / (dx * dx) + nu / dx)
 
-    n_in = M - 1
-    sub = -A_ * np.ones(n_in)
-    diag = (1 - B_) * np.ones(n_in)
-    sup = -C_ * np.ones(n_in)
-
-    for n in range(N):
-        rhs = A_ * V[:-2] + (1 + B_) * V[1:-1] + C_ * V[2:]
-
-        tau = (n + 1) * dt
-        if is_call:
-            V_lo = 0.0
-            V_hi = Sg[-1] * math.exp(-q * tau) - K * math.exp(-r * tau)
-        else:
-            V_lo = K * math.exp(-r * tau)
-            V_hi = 0.0
-        rhs[0] += A_ * V_lo
-        rhs[-1] += C_ * V_hi
-
-        # Brennan-Schwartz: forward elimination, then back-substitution that
-        # clamps to the payoff. For a put the exercise region is at low S,
-        # so we sweep from high S downward (standard tridiagonal direction).
-        # For a call (only relevant with q>0) the exercise region is at high S,
-        # so we reverse the system before solving.
-        if is_call:
-            # Reverse the tridiagonal so back-sweep starts from high S
-            sub_r = sup[::-1].copy()
-            sup_r = sub[::-1].copy()
-            diag_r = diag[::-1].copy()
-            rhs_r = rhs[::-1].copy()
-            payoff_r = payoff[1:-1][::-1]
-            sol_r = _bs_solve(sub_r, diag_r, sup_r, rhs_r, payoff_r)
-            sol = sol_r[::-1]
-        else:
-            sol = _bs_solve(sub, diag, sup, rhs, payoff[1:-1])
-
-        V[0] = V_lo
-        V[-1] = V_hi
-        V[1:-1] = sol
+    _american_march(V, payoff, A_, B_, C_, dt, r, q, Sg[-1], K, is_call, N)
 
     # Local quadratic instead of linear interpolation: linear interp is flat in
     # its second derivative inside a cell, which would zero out finite-difference
@@ -176,23 +139,70 @@ def american_pde(S, K, T, r, q, sig, is_call, M=200, N=200, grid_center=None, gr
     return float(lm * V[i - 1] + lc * V[i] + lp * V[i + 1])
 
 
+def _american_march(V, payoff, A_, B_, C_, dt, r, q, S_top, K, is_call, N):
+    n = V.shape[0] - 2
+    for step in range(N):
+        rhs = A_ * V[:-2] + (1.0 + B_) * V[1:-1] + C_ * V[2:]
+
+        tau = (step + 1) * dt
+        if is_call:
+            V_lo = 0.0
+            V_hi = S_top * math.exp(-q * tau) - K * math.exp(-r * tau)
+        else:
+            V_lo = K * math.exp(-r * tau)
+            V_hi = 0.0
+        rhs[0] += A_ * V_lo
+        rhs[n - 1] += C_ * V_hi
+
+        # Brennan-Schwartz: forward elimination, then back-substitution that
+        # clamps to the payoff. For a put the exercise region is at low S,
+        # so we sweep from high S downward (standard tridiagonal direction).
+        # For a call (only relevant with q>0) the exercise region is at high S,
+        # so we reverse the system before solving. The tridiagonal is Toeplitz,
+        # so reversal just swaps the sub/super scalars.
+        if is_call:
+            rhs_r = rhs[::-1].copy()
+            payoff_r = payoff[1:-1][::-1].copy()
+            sol_r = _bs_solve(-C_, 1.0 - B_, -A_, rhs_r, payoff_r)
+            sol = sol_r[::-1].copy()
+        else:
+            sol = _bs_solve(-A_, 1.0 - B_, -C_, rhs, payoff[1:-1].copy())
+
+        V[0] = V_lo
+        V[n + 1] = V_hi
+        V[1:-1] = sol
+
+
 def _bs_solve(sub, diag, sup, rhs, payoff):
     # Brennan-Schwartz: standard Thomas elimination, back-substitution applies
-    # the constraint V >= payoff at each step.
-    n = len(diag)
+    # the constraint V >= payoff at each step. sub/diag/sup are the constant
+    # Toeplitz scalars of the Crank-Nicolson tridiagonal.
+    n = rhs.shape[0]
     cp = np.empty(n)
     dp = np.empty(n)
-    cp[0] = sup[0] / diag[0]
-    dp[0] = rhs[0] / diag[0]
+    cp[0] = sup / diag
+    dp[0] = rhs[0] / diag
     for i in range(1, n):
-        m = diag[i] - sub[i] * cp[i - 1]
-        cp[i] = sup[i] / m if i < n - 1 else 0.0
-        dp[i] = (rhs[i] - sub[i] * dp[i - 1]) / m
+        m = diag - sub * cp[i - 1]
+        cp[i] = (sup / m) if i < n - 1 else 0.0
+        dp[i] = (rhs[i] - sub * dp[i - 1]) / m
     sol = np.empty(n)
-    sol[-1] = max(dp[-1], payoff[-1])
+    sol[n - 1] = max(dp[n - 1], payoff[n - 1])
     for i in range(n - 2, -1, -1):
         sol[i] = max(dp[i] - cp[i] * sol[i + 1], payoff[i])
     return sol
+
+
+# JIT-compile the PDE hot loops when numba is available (10x+ on American
+# pricing); fall back to the identical pure-Python versions otherwise so the
+# app still runs on environments where numba has no wheel.
+try:
+    from numba import njit as _njit
+
+    _bs_solve = _njit(cache=True)(_bs_solve)
+    _american_march = _njit(cache=True)(_american_march)
+except ImportError:
+    pass
 
 
 def iv_european(price, S, K, T, r, q, is_call):
@@ -386,7 +396,7 @@ def fit_surface(S, curve, divs, repo, ivs):
     return out
 
 
-def compute_greeks(S, curve, divs, repo, coefs, ivs, american, M=120, N=120):
+def compute_greeks(S, curve, divs, repo, coefs, ivs, american, M=120, N=120, otm_only=False):
     """Returns {tenor: [(K, is_call, iv, delta, skew_delta, gamma, skew_gamma), ...]}"""
     out = {}
     for t, rows in ivs.items():
@@ -395,8 +405,11 @@ def compute_greeks(S, curve, divs, repo, coefs, ivs, american, M=120, N=120):
         S_eff = S - pv_divs(divs, t, curve)
         cf = coefs.get(t)
         h = GREEK_BUMP_REL * S_eff
+        F_t = S_eff * math.exp((r - q) * t)
         res = []
         for K, is_call, sig in rows:
+            if otm_only and not ((is_call and K >= F_t) or ((not is_call) and K <= F_t)):
+                continue
             if american:
                 p_mid = american_pde(S_eff, K, t, r, q, sig, is_call, M, N, grid_center=S_eff)
                 p_up = american_pde(S_eff + h, K, t, r, q, sig, is_call, M, N, grid_center=S_eff)
@@ -560,8 +573,14 @@ def choose_expiries(expiry_strings, today):
 def load_option_quotes(ticker, spot, selected_expiries):
     quotes, rates = {}, {}
     skipped = []
+    last_quote_time = None
     for expiry, t in selected_expiries:
         chain = ticker.option_chain(expiry)
+        for side in (chain.calls, chain.puts):
+            if "lastTradeDate" in side.columns and len(side):
+                ts = side["lastTradeDate"].max()
+                if last_quote_time is None or ts > last_quote_time:
+                    last_quote_time = ts
         strikes = sorted(set(chain.calls["strike"]).intersection(set(chain.puts["strike"])))
 
         # Center the strike sample around an approximate forward, not just spot.
@@ -604,7 +623,7 @@ def load_option_quotes(ticker, spot, selected_expiries):
 
     if not quotes:
         raise RuntimeError("No usable option quotes found for any selected expiry.")
-    return quotes, rates
+    return quotes, rates, last_quote_time
 
 
 def fetch_fred_rate(series_id, api_key):
@@ -711,19 +730,22 @@ def load_latest_data(fred_api_key=FRED_API_KEY):
 
     warnings = []
     try:
-        spx_q, spx_r = load_option_quotes(spx_ticker, spx_spot, spx_expiries)
+        spx_q, spx_r, spx_quote_time = load_option_quotes(spx_ticker, spx_spot, spx_expiries)
     except Exception as exc:
-        spx_q, spx_r = {}, {}
+        spx_q, spx_r, spx_quote_time = {}, {}, None
         warnings.append(f"Could not fetch usable SPX option chains from yfinance: {exc}")
 
     try:
-        spy_q, spy_r = load_option_quotes(spy_ticker, spy_spot, spy_expiries)
+        spy_q, spy_r, spy_quote_time = load_option_quotes(spy_ticker, spy_spot, spy_expiries)
     except Exception as exc:
-        spy_q, spy_r = {}, {}
+        spy_q, spy_r, spy_quote_time = {}, {}, None
         warnings.append(f"Could not fetch usable SPY option chains from yfinance: {exc}")
 
     if not spx_q and not spy_q:
         raise RuntimeError("Could not fetch usable SPX or SPY option chains from yfinance.")
+
+    quote_times = [ts for ts in (spx_quote_time, spy_quote_time) if ts is not None]
+    quote_time = max(quote_times) if quote_times else None
 
     try:
         curve = sorted(load_fred_curve(fred_api_key), key=lambda x: x[0])
@@ -762,6 +784,8 @@ def load_latest_data(fred_api_key=FRED_API_KEY):
         "spy_quotes": spy_q, "spy_rates": spy_r,
         "spx_div_yield": spx_div_yield, "spy_div_yield": spy_div_yield,
         "spy_divs": spy_divs,
+        "quote_time": quote_time,
+        "fetch_time": datetime.now().astimezone(),
         "warnings": warnings,
     }
 

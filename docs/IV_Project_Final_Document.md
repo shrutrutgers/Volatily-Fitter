@@ -148,18 +148,44 @@ IV(x) = a + b*x + c*x^2, where x = log(K/F)
 - `b` = skew
 - `c` = curvature
 
-### Step 8: Visualization and Dashboard Output
+### Step 8: Greeks Computation
 
-Finally, we display the fitted repo curve, implied volatility table, quadratic surface coefficients, volatility smiles across tenors, and the 3D implied volatility surface. The plotted smiles and surfaces use OTM options only, so the visualization focuses on the most liquid and commonly quoted side of the volatility surface.
+For every option that survives cleaning and IV inversion, we compute delta and gamma under two conventions:
+
+- **Plain (fixed-IV)**: the standard Black-Scholes spot sensitivity holding the option's own fitted IV constant. For SPX (European) this uses the closed-form expressions. For SPY (American) there is no closed form, so we use central finite differences through the Crank-Nicolson PDE pricer, with all bumped solves pinned to a single shared grid (re-centering the grid per solve introduces discretization noise that would swamp the second difference used for gamma).
+- **Skew-adjusted (sticky-moneyness)**: the total spot sensitivity accounting for the option sliding along the fitted smile as spot moves. When spot is bumped, the forward moves, the option's log-moneyness `x = log(K/F)` changes, and its effective IV is re-read from the already-fitted quadratic `a + b*x + c*x^2` before repricing. Skew-adjusted greeks are then finite differences of these smile-consistent prices.
+
+The bump size is 0.1% of effective spot. Greeks are computed for OTM options only (matching the smile/surface convention). In the dashboard, the Greeks tab shows one expiry at a time (selectable via dropdown, defaulting to the nearest expiry), and put deltas are plotted as call-equivalent delta (`1 + put delta`) so the put and call wings form one continuous curve; the table and CSV retain raw signed deltas.
+
+For performance, the Crank-Nicolson time-stepping and Brennan-Schwartz solver are JIT-compiled with numba (with a pure-Python fallback when numba is unavailable). This makes each PDE solve sub-millisecond, so the full SPY American pipeline — repo bootstrap, IV inversion, and greeks — completes in well under a second.
+
+#### The ATM kink in long tenors
+
+The greek curves show a visible kink at the ATM boundary (`log-moneyness = 0`), and it grows with time to expiry. This is expected behavior, not a numerical artifact, and it is informative in its own right:
+
+- The OTM series switches instrument at the boundary — puts to the left of `x = 0`, calls to the right — so adjacent points come from different quotes with different implied vols.
+- The call-equivalent transform `1 + put delta = call delta` is an identity only under **European put-call parity**. American options do not satisfy parity as an equality (only as an inequality): American puts carry extra early-exercise premium, amplified by discrete dividends, so their transformed delta and their gamma sit systematically off the call line. For SPY (American) this is the dominant effect at long tenors — e.g. at the ~1-year tenor, put and call IVs at the same strike diverge by up to a few vol points in the wings.
+- A single bootstrapped repo rate per tenor cannot perfectly reconcile noisy put and call quotes on both sides of the forward, and this misalignment also contributes to the jump.
+- The pure dividend/carry offset (`1 − e^(−qT)`) is small by comparison (well under one delta point at one year).
+
+SPX (European) shows a much smaller kink at the same spot, which confirms the American early-exercise premium — rather than dividends per se — as the primary driver of the SPY kink. In effect, the size of the ATM kink is a visual measure of how far the American options deviate from European parity at that tenor.
+
+### Step 9: Visualization and Dashboard Output
+
+Finally, we display the fitted repo curve, implied volatility table, quadratic surface coefficients, volatility smiles across tenors, the 3D implied volatility surface, and per-expiry greeks. The plotted smiles and surfaces use OTM options only, so the visualization focuses on the most liquid and commonly quoted side of the volatility surface.
+
+The run summary reports the timestamp of the latest option trade seen in the fetched chains (in ET) and warns when quotes are more than 30 minutes old, which typically means the market is closed and the surface reflects the last session. Live data fetches are cached for 15 minutes, so repeated runs within that window reuse the same snapshot instead of re-hitting Yahoo Finance and FRED.
 
 ## 5. Dashboard Features
 
-- Fetch latest market data
+- Fetch latest market data (cached for 15 minutes; runs automatically on first visit and hourly thereafter, with the last downloaded snapshot persisted to disk so new visitors always see a surface)
 - Upload Excel file
 - View SPX/SPY surfaces
 - View smiles across tenors
 - View front-month smile
-- Download IV data
+- View plain and skew-adjusted delta/gamma per expiry (Greeks tab with expiry dropdown)
+- See the latest option quote timestamp and a stale-quote warning when the market is closed
+- Download IV and greeks data as CSV
 - Inspect repo curve, IV table, and coefficients
 
 ## 6. Interpretation Guide
@@ -170,12 +196,14 @@ Finally, we display the fitted repo curve, implied volatility table, quadratic s
 - Higher left-wing IV means downside protection is more expensive
 - Repo curve instability can signal noisy short-tenor data
 - Spikes can come from short-dated OTM put skew
+- A kink in the greek curves at the ATM boundary that grows with tenor measures the deviation of American options from European put-call parity (early-exercise premium); see the Greeks section
 
 ## 7. Limitations
 
-- Yahoo Finance data may be delayed or stale
-- Bid/ask quality varies
+- Yahoo Finance data may be delayed or stale (the dashboard surfaces the latest trade timestamp to make this visible)
+- Bid/ask quality varies; some expiries have thin two-sided coverage, so a tenor can show only a few strikes
 - The quadratic fit is simple and not arbitrage-free; this version does not perform arbitrage checks
+- Skew-adjusted greeks inherit any misfit of the quadratic smile, since bumped IVs are read off the fitted coefficients
 - No SVI/SABR smoothing yet
 - Repo bootstrapping can be unstable for short tenors
 - This is not intended for trading or risk decisions

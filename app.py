@@ -1,5 +1,8 @@
 import math
+import os
+import pickle
 import tempfile
+import time
 from io import BytesIO
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -17,6 +20,8 @@ import volatility_fitting_daily as vf
 SPX_DIV_YIELD = 0.0134
 SPY_DIVS = [(0.25, 1.90), (0.50, 2.10), (0.75, 1.90), (1.00, 1.92)]
 DATA_FETCH_VERSION = "six-tenors-no-1w-target-moneyness-repo-fallback-prior"
+SNAPSHOT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "latest_run.pkl")
+SNAPSHOT_MAX_AGE_SECONDS = 3600
 
 
 def fallback_spy_div_yield(spot):
@@ -123,6 +128,9 @@ st.markdown(
         color: var(--text);
         font-weight: 800;
         font-size: 1.1rem;
+    }
+    .st-key-runtime-metric div[data-testid="stMetricValue"] {
+        font-size: 0.9rem;
     }
     [data-testid="stVerticalBlockBorderWrapper"], [data-testid="stExpander"] {
         border-color: var(--line);
@@ -284,8 +292,41 @@ def sample_workbook_bytes():
     return out.getvalue()
 
 
+# 15-minute TTL: repeated runs reuse the snapshot instead of re-hitting
+# yfinance/FRED, which rate-limit shared IPs on Streamlit Community Cloud.
+@st.cache_data(ttl=900, show_spinner=False)
 def load_latest_cached(fred_api_key, version):
     return vf.load_latest_data(fred_api_key)
+
+
+def save_snapshot(data, source_label, results, fetched_at):
+    try:
+        with open(SNAPSHOT_PATH, "wb") as f:
+            pickle.dump({
+                "data": data,
+                "source_label": source_label,
+                "results": results,
+                "saved_at": fetched_at,
+            }, f)
+    except Exception:
+        pass
+
+
+def load_snapshot():
+    try:
+        with open(SNAPSHOT_PATH, "rb") as f:
+            return pickle.load(f)
+    except Exception:
+        return None
+
+
+def apply_snapshot(snapshot, asset_choice):
+    st.session_state["run_data"] = snapshot["data"]
+    st.session_state["run_source_label"] = snapshot["source_label"]
+    st.session_state["run_mode"] = "Fetch latest data"
+    st.session_state["run_asset_choice"] = asset_choice
+    st.session_state["run_asset_results"] = snapshot["results"]
+    st.session_state["run_fetched_at"] = snapshot["saved_at"]
 
 
 def analyze_asset(label, spot, divs, ydiv, quotes, curve, american, per_tenor, version):
@@ -299,7 +340,7 @@ def analyze_asset(label, spot, divs, ydiv, quotes, curve, american, per_tenor, v
 
     ivs = vf.compute_ivs(spot, rate_curve, div_list, repo, quotes, american)
     coefs = vf.fit_surface(spot, rate_curve, div_list, repo, ivs)
-    greeks = vf.compute_greeks(spot, rate_curve, div_list, repo, coefs, ivs, american)
+    greeks = vf.compute_greeks(spot, rate_curve, div_list, repo, coefs, ivs, american, otm_only=True)
 
     repo_rows = []
     for t in sorted(repo):
@@ -316,12 +357,13 @@ def analyze_asset(label, spot, divs, ydiv, quotes, curve, american, per_tenor, v
 
     iv_rows = []
     greek_rows = []
-    for t, rows in greeks.items():
+    for t, rows in ivs.items():
         r = vf.interp_rate(rate_curve, t)
         forward = (spot - vf.pv_divs(div_list, t, rate_curve)) * math.exp((r - repo[t]) * t)
-        for strike, is_call, iv, delta, skew_delta, gamma, skew_gamma in rows:
+
+        def base_row(strike, is_call, iv):
             is_otm = (is_call and strike >= forward) or ((not is_call) and strike <= forward)
-            base = {
+            return {
                 "asset": label,
                 "tenor": t,
                 "strike": strike,
@@ -332,9 +374,12 @@ def analyze_asset(label, spot, divs, ydiv, quotes, curve, american, per_tenor, v
                 "log_moneyness": math.log(strike / forward),
                 "forward": forward,
             }
-            iv_rows.append(base)
+
+        for strike, is_call, iv in rows:
+            iv_rows.append(base_row(strike, is_call, iv))
+        for strike, is_call, iv, delta, skew_delta, gamma, skew_gamma in greeks.get(t, []):
             greek_rows.append({
-                **base,
+                **base_row(strike, is_call, iv),
                 "delta": delta,
                 "skew_delta": skew_delta,
                 "gamma": gamma,
@@ -677,7 +722,23 @@ st.markdown(
     "and visualizes the fitted quadratic surface."
 )
 
-if run_clicked:
+# Streamlit is request-driven, so "refresh hourly" means: on every page load,
+# check the age of what we have and refetch if it's older than an hour. New
+# visitors get the last saved snapshot instantly; the first visit after startup
+# (or after the snapshot goes stale) triggers a fresh fetch automatically.
+auto_fetch = False
+if not run_clicked and mode == "Fetch latest data":
+    if st.session_state.get("run_mode") == "Fetch latest data" and "run_data" in st.session_state:
+        if time.time() - st.session_state.get("run_fetched_at", 0) > SNAPSHOT_MAX_AGE_SECONDS:
+            auto_fetch = True
+    elif "run_data" not in st.session_state:
+        snapshot = load_snapshot()
+        if snapshot is not None and time.time() - snapshot["saved_at"] <= SNAPSHOT_MAX_AGE_SECONDS:
+            apply_snapshot(snapshot, asset_choice)
+        else:
+            auto_fetch = True
+
+if run_clicked or auto_fetch:
     try:
         with st.spinner("Loading market data..."):
             if mode == "Fetch latest data":
@@ -694,17 +755,26 @@ if run_clicked:
                 data = load_excel_from_upload(uploaded)
                 source_label = uploaded.name
     except Exception as exc:
-        st.error(str(exc))
-        st.stop()
-
-    # Cache across reruns: any widget touch (e.g. the Greeks expiry dropdown)
-    # reruns this whole script and st.button reverts to False, so results must
-    # survive outside the run_clicked branch or the page resets to the intro screen.
-    st.session_state["run_data"] = data
-    st.session_state["run_source_label"] = source_label
-    st.session_state["run_mode"] = mode
-    st.session_state["run_asset_choice"] = asset_choice
-    st.session_state["run_asset_results"] = {}
+        # A failed auto-refresh shouldn't blank the page if an older snapshot exists.
+        snapshot = load_snapshot()
+        if snapshot is not None and "run_data" not in st.session_state:
+            st.warning(f"Live fetch failed ({exc}); showing the last saved snapshot instead.")
+            apply_snapshot(snapshot, asset_choice)
+        elif "run_data" in st.session_state:
+            st.warning(f"Refresh failed ({exc}); continuing with previously loaded data.")
+        else:
+            st.error(str(exc))
+            st.stop()
+    else:
+        # Cache across reruns: any widget touch (e.g. the Greeks expiry dropdown)
+        # reruns this whole script and st.button reverts to False, so results must
+        # survive outside the run_clicked branch or the page resets to the intro screen.
+        st.session_state["run_data"] = data
+        st.session_state["run_source_label"] = source_label
+        st.session_state["run_mode"] = mode
+        st.session_state["run_asset_choice"] = asset_choice
+        st.session_state["run_asset_results"] = {}
+        st.session_state["run_fetched_at"] = time.time()
 
 if "run_data" not in st.session_state:
     st.info("Choose a data source in the sidebar and click Run analysis.")
@@ -743,9 +813,33 @@ cols = st.columns(4)
 cols[0].metric("Source", mode)
 cols[1].metric("SPX spot", f"{data['spx_spot']:,.2f}")
 cols[2].metric("SPY spot", f"{data['spy_spot']:,.2f}")
-run_time_et = datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d %H:%M %Z")
-cols[3].metric("Run time (ET)", run_time_et)
-st.caption(source_label)
+quote_time = data.get("quote_time")
+if quote_time is not None:
+    quote_ts = pd.Timestamp(quote_time)
+    if quote_ts.tzinfo is None:
+        quote_ts = quote_ts.tz_localize("UTC")
+    quote_ts_et = quote_ts.tz_convert("America/New_York")
+    cols[3].metric("Quotes as of (ET)", quote_ts_et.strftime("%Y-%m-%d %H:%M"))
+    age_minutes = (pd.Timestamp.now(tz="America/New_York") - quote_ts_et).total_seconds() / 60
+    if age_minutes > 30:
+        st.caption(
+            f"Latest option trade is {age_minutes / 60:.1f} hours old — the market is likely closed "
+            "or quotes are delayed, so the surface reflects the last session."
+        )
+else:
+    run_time_et = datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d %H:%M %Z")
+    with cols[3]:
+        with st.container(key="runtime-metric"):
+            st.metric("Run time (ET)", run_time_et)
+if mode == "Fetch latest data":
+    fetched_at = st.session_state.get("run_fetched_at")
+    fetched_note = ""
+    if fetched_at:
+        fetched_dt = datetime.fromtimestamp(fetched_at, ZoneInfo("America/New_York"))
+        fetched_note = f" Data fetched {fetched_dt.strftime('%Y-%m-%d %H:%M %Z')};"
+    st.caption(source_label + " —" + fetched_note + " auto-refreshes when more than an hour old.")
+else:
+    st.caption(source_label)
 for warning in data.get("warnings", []):
     st.warning(warning)
 
@@ -807,7 +901,24 @@ for label, spot, divs, ydiv, quotes, american, rates in assets:
                 use_container_width=True,
                 key=f"{label}-greeks",
             )
-            st.markdown(f"**Greeks — {tenor_label(selected_tenor)}**")
+            if american:
+                st.caption(
+                    "Note: A kink at the ATM boundary (log-moneyness 0) is expected, especially for long tenors. "
+                    "The curve switches from OTM puts to OTM calls there, and the two sides do not stitch perfectly: "
+                    "the call-equivalent transform (1 + put delta) is exact only under European put-call parity, "
+                    "which American options do not satisfy — American puts carry extra early-exercise premium "
+                    "(amplified by dividends), so their delta and gamma sit systematically off the call line. "
+                    "Put/call IV misalignment from the single bootstrapped repo rate adds to the jump. "
+                    "These effects grow with time to expiry, so the kink is largest at the longest tenors."
+                )
+            else:
+                st.caption(
+                    "Note: a small kink at the ATM boundary (log-moneyness 0) can appear where the curve switches "
+                    "from OTM puts to OTM calls. For European options put-call parity holds in theory, so the "
+                    "residual jump reflects put/call quote noise and any repo-rate misfit rather than early "
+                    "exercise; it grows with tenor as carry uncertainty accumulates."
+                )
+            st.markdown(f"**Greeks — {tenor_label(selected_tenor)} (OTM options)**")
             st.dataframe(
                 greeks_df[greeks_df["tenor"] == selected_tenor],
                 use_container_width=True,
@@ -849,4 +960,12 @@ for label, spot, divs, ydiv, quotes, american, rates in assets:
         greeks_csv,
         file_name=f"{label.lower()}_greeks.csv",
         mime="text/csv",
+    )
+
+if mode == "Fetch latest data":
+    save_snapshot(
+        data,
+        source_label,
+        st.session_state["run_asset_results"],
+        st.session_state.get("run_fetched_at", time.time()),
     )
